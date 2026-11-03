@@ -1,0 +1,111 @@
+
+name: Build ReacherOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stage-a:
+    name: Stage A - download and verify base ISO
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Get repository files
+        uses: actions/checkout@v4
+
+      - name: Load base ISO settings
+        run: |
+          set -euo pipefail
+          source config/base-iso.env
+          echo "BASE_ISO_SHA256=$BASE_ISO_SHA256" >> "$GITHUB_ENV"
+
+      - name: Restore cached base ISO
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: work/base.iso
+          key: base-iso-293381af0b7c48399abe015da8f67d41fd34372b73c4aafcf53747fbaed22371
+
+      - name: Download base ISO
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          source config/base-iso.env
+          mkdir -p work
+
+          for url in "$BASE_ISO_URL" "$BASE_ISO_MIRROR_URL"; do
+            echo "Trying: $url"
+
+            if curl -L --fail --retry 3 --retry-delay 10 \
+              --connect-timeout 30 -A "Mozilla/5.0" \
+              -o work/base.iso "$url"; then
+
+              if echo "$BASE_ISO_SHA256  work/base.iso" | sha256sum -c -; then
+                echo "Download verified."
+                exit 0
+              fi
+
+              echo "Checksum mismatch, trying next source."
+            fi
+
+            rm -f work/base.iso
+          done
+
+          echo "::error::Could not download a verified copy of the base ISO."
+          exit 1
+
+      - name: Verify checksum
+        run: |
+          set -euo pipefail
+          source config/base-iso.env
+          echo "$BASE_ISO_SHA256  work/base.iso" | sha256sum -c -
+          ls -lh work/base.iso
+          echo "Base ISO $BASE_ISO_NAME verified (SHA256 $BASE_ISO_SHA256)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso squashfs-tools
+
+      - name: Inspect ISO layout (read-only report)
+        run: |
+          set -u
+          set -o pipefail
+          R=work/stage-a-report.txt
+          mkdir -p work
+
+          {
+            echo "=== Top-level files ==="
+            xorriso -indev work/base.iso -lsl /
+            echo
+
+            echo "=== Boot entries (BIOS/UEFI) ==="
+            xorriso -indev work/base.iso -report_el_torito plain
+            echo
+
+            echo "=== Key files ==="
+            xorriso -indev work/base.iso -find / -name linuxfs
+            xorriso -indev work/base.iso -find / -name 'vmlinuz*'
+            xorriso -indev work/base.iso -find / -name 'initrd*'
+            echo
+
+            echo "=== linuxfs details ==="
+            LINUXFS=$(xorriso -indev work/base.iso -find / -name linuxfs 2>/dev/null | grep "^'/" | head -1 | tr -d "'")
+            echo "linuxfs path in ISO: ${LINUXFS:-NOT FOUND}"
+
+            if [ -n "${LINUXFS:-}" ]; then
+              xorriso -osirrox on -indev work/base.iso -extract "$LINUXFS" work/linuxfs
+              unsquashfs -s work/linuxfs
+            fi
+          } 2>&1 | tee "$R"
+
+      - name: Save report
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-a-report
+          path: work/stage-a-report.txt
+          retention-days: 7
